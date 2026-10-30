@@ -3,4 +3,4 @@
 awk -v head="## [${1#v}]" '
     index($0, "## ") == 1 { p = index($0, head) == 1; next }
     /^\[[^]]*\]: / { next }
-    p' CHANGELOG.md
+    p' "$(dirname "$0")/../CHANGELOG.md"
