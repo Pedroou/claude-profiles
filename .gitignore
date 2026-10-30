@@ -1,0 +1,11 @@
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Local agent state
+.superpowers/
+.playwright-mcp/
+.claude/settings.local.json

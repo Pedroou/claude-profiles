@@ -1,0 +1,33 @@
+name: release
+
+# A release is an annotated tag: its message is the release notes.
+#   git tag -a v1.1.0 -m "…" && git push origin v1.1.0
+# The tests run first, so a tag on a broken commit publishes nothing.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    needs: tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # actions/checkout leaves a tag lightweight; this brings back its message.
+      - run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+
+      # A tag moved after its release was published keeps that release.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag --title "$GITHUB_REF_NAME"

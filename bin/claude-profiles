@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# claude-profiles: several Claude Code accounts, one Claude Code.
+# The shells' `claude` is `claude-profiles launch`. See README.md and docs/design.md.
+
+hub=$HOME/.claude
+state=${XDG_STATE_HOME:-$HOME/.local/state}/claude-profiles
+shared=(CLAUDE.md rules agents commands skills output-styles keybindings.json settings.json plugins
+    projects file-history history.jsonl paste-cache image-cache todos plans)
+sessions=" projects file-history paste-cache image-cache todos plans "
+shopt -s nullglob
+
+say() { printf 'claude-profiles: %s\n' "$*" >&2; }
+tilde() { REPLY=${1/#"$HOME"/\~}; }
+joined() { local IFS=,; REPLY="$*"; REPLY=${REPLY//,/, }; }
+
+# What's remembered between runs, one file per key: `last` (the profile plain
+# `claude` opens) and `default-name` (what ~/.claude is called).
+get() {
+    REPLY=
+    [[ -f $state/$1 ]] && read -r REPLY <"$state/$1"
+    [[ -n $REPLY ]]
+}
+put() {
+    [[ -d $state ]] || mkdir -p "$state"
+    printf '%s\n' "$2" >"$state/$1"
+}
+
+# The disk is the list of profiles: ~/.claude, and any ~/.claude-<name> Claude
+# Code has started in (it holds .claude.json or .credentials.json).
+load() {
+    get default-name && default=$REPLY || default=default
+    names=("$default") dirs=("$hub")
+    local dir name
+    for dir in "$HOME"/.claude-*; do
+        [[ -d $dir && ! -L $dir ]] || continue
+        [[ -f $dir/.claude.json || -f $dir/.credentials.json ]] || continue
+        name=${dir#"$HOME/.claude-"}
+        [[ $name =~ ^[a-z0-9][a-z0-9_-]*$ && $name != "$default" ]] || continue
+        names+=("$name") dirs+=("$dir")
+    done
+}
+dir_of() {
+    local i
+    for i in "${!names[@]}"; do
+        [[ ${names[i]} == "$1" ]] && REPLY=${dirs[i]} && return 0
+    done
+    return 1
+}
+
+# How many sessions are running in a profile. A record in <dir>/sessions/
+# outlives a killed session, and pids get reused, so it only counts if its
+# process's start time (field 22 of /proc/<pid>/stat) matches the record's
+# procStart - the check Claude Code makes itself.
+running() {
+    local proc=${CLAUDE_PROFILES_PROC:-/proc} record pid text stat fields
+    REPLY=0
+    for record in "$1"/sessions/*.json; do
+        pid=${record##*/} pid=${pid%.json}
+        [[ $pid =~ ^[0-9]+$ && -r $proc/$pid/stat ]] || continue
+        read -rd '' text <"$record"
+        if [[ $text =~ \"procStart\"[[:space:]]*:[[:space:]]*\"?([0-9]+) ]]; then
+            # The command name may hold spaces and parentheses, so count from
+            # the last ')': field 22 is then the 20th.
+            read -r stat <"$proc/$pid/stat"
+            read -ra fields <<<"${stat##*)}"
+            [[ ${fields[19]} == "${BASH_REMATCH[1]}" ]] || continue
+        fi
+        REPLY=$((REPLY + 1))
+    done
+    ((REPLY > 0))
+}
+
+# Make a profile use the one shared copy of everything that isn't about its
+# account. Silent unless it changed something.
+share() {
+    local dir=$1 name=${1#"$HOME/.claude-"} entry here there backup= stamp
+    local -a merged=() aside=() waiting=() failed=()
+
+    for entry in "${shared[@]}"; do
+        here=$dir/$entry there=$hub/$entry
+        [[ -L $here ]] && continue
+
+        # -T throughout: never move into, or link inside, a directory that a
+        # launch running at the same moment has just put in place.
+        if [[ ! -e $here ]]; then
+            [[ -e $there ]] && ln -sT "$there" "$here" 2>/dev/null
+            continue
+        fi
+
+        if [[ ! -e $there ]]; then
+            # A move within a filesystem leaves open files open, so this is
+            # safe even with a session running.
+            mkdir -p "$hub"
+            { mv -T "$here" "$there" 2>/dev/null && ln -sT "$there" "$here"; } ||
+                [[ -L $here ]] || # a launch alongside this one did it first
+                failed+=("$entry")
+            continue
+        fi
+
+        # Both sides have one, and moving this one pulls files out from under
+        # any session that has them open.
+        if running "$dir"; then
+            waiting+=("$entry")
+            continue
+        fi
+
+        if [[ -z $backup ]]; then
+            printf -v stamp '%(%Y%m%d-%H%M%S)T' -1
+            backup=$hub/backups/profiles-$stamp-$name
+        fi
+        [[ $entry == settings.json ]] && pin "$dir"
+        if [[ $sessions == *" $entry "* && -d $here && -d $there ]]; then
+            # The first pass brings over what's newer here and backs up the
+            # shared version it replaces; the second backs up this side's
+            # version wherever the shared one was newer.
+            if ! command -v rsync >/dev/null; then
+                failed+=("$entry (merging it needs rsync)")
+            elif rsync -a --update --backup --backup-dir="$backup/$entry" "$here/" "$there/" &&
+                rsync -a --existing --update --backup --backup-dir="$backup/$entry" "$there/" "$here/" &&
+                rm -rf "$here" && ln -sT "$there" "$here"; then
+                merged+=("$entry")
+            else
+                failed+=("$entry")
+            fi
+        elif mkdir -p "$backup" && mv -T "$here" "$backup/$entry" && ln -sT "$there" "$here"; then
+            aside+=("$entry")
+        else
+            failed+=("$entry")
+        fi
+    done
+
+    repoint "$dir/plugins/" "$hub/plugins/"
+
+    joined "${merged[@]}" && ((${#merged[@]})) && say "merged $name's own $REPLY into the shared copy."
+    joined "${aside[@]}" && ((${#aside[@]})) && say "$name had its own $REPLY; it now uses the shared one."
+    [[ -n $backup && -d $backup ]] && say "Anything that was replaced is in $backup"
+    if ((${#waiting[@]})); then
+        joined "${waiting[@]}"
+        say "$name has its own $REPLY; it joins the shared copy the next time nothing is running in $name."
+    fi
+    if ((${#failed[@]})); then
+        joined "${failed[@]}"
+        say "couldn't share $REPLY for $name; it keeps its own for now."
+        return 1
+    fi
+}
+
+# Before two settings.json become one: the model settings they disagree on -
+# what each plan can run - become each side's own, in its account-settings.json.
+pin() {
+    local dir=$1 i
+    local -a pins files=("$1/account-settings.json" "$hub/account-settings.json")
+    mapfile -t pins < <(jq -c -n --slurpfile mine "$dir/settings.json" --slurpfile shared "$hub/settings.json" '
+        [("model", "effortLevel", "advisorModel") as $k | select($mine[0][$k] != $shared[0][$k]) | $k] as $own
+        | ($mine[0], $shared[0]) | with_entries(select(.key | IN($own[])))' 2>/dev/null)
+    ((${#pins[@]} == 2)) || return
+    for i in 0 1; do
+        [[ ${pins[i]} != '{}' && ! -e ${files[i]} ]] || continue
+        printf '%s\n' "${pins[i]}" >"${files[i]}"
+        tilde "${files[i]}"
+        say "$REPLY keeps that account's own ${pins[i]}"
+    done
+}
+
+# Claude Code records plugins by absolute path, and one installed from a profile
+# is recorded through that profile's link, which breaks once the profile is
+# renamed or removed. A string match per launch; jq only when there's a fix.
+repoint() {
+    local from=$1 to=$2 registry text
+    for registry in "$to/installed_plugins.json" "$to/known_marketplaces.json"; do
+        [[ -f $registry ]] || continue
+        read -rd '' text <"$registry"
+        [[ $text == *\""$from"* ]] || continue
+        jq --arg from "$from" --arg to "$to" '
+            walk(if type == "string" and startswith($from)
+                 then $to + .[($from | length):] else . end)' "$registry" >"$registry.$$.tmp" &&
+            mv "$registry.$$.tmp" "$registry" || rm -f "$registry.$$.tmp"
+    done
+}
+
+# launch [profile] [claude's own arguments…]
+launch() {
+    load
+    local dir i
+    if (($#)) && dir_of "$1"; then
+        dir=$REPLY
+        put last "$1"
+        shift
+    elif [[ -n $CLAUDE_CONFIG_DIR ]]; then
+        # An explicit choice, as in a copied `CLAUDE_CONFIG_DIR=… claude --resume <id>`.
+        dir=$CLAUDE_CONFIG_DIR
+    elif get last && dir_of "$REPLY"; then
+        dir=$REPLY
+    else
+        dir=$hub # nothing remembered, or a profile since renamed or removed
+    fi
+
+    for ((i = 1; i < ${#dirs[@]}; i++)); do
+        share "${dirs[i]}"
+    done
+
+    local -a own=()
+    [[ -f $dir/account-settings.json ]] && own=(--settings "$dir/account-settings.json")
+    # The default runs with CLAUDE_CONFIG_DIR unset: set, Claude Code would look
+    # for its state file inside ~/.claude rather than at ~/.claude.json, and
+    # start as if for the first time.
+    if [[ $dir == "$hub" || $dir -ef $hub ]]; then
+        unset CLAUDE_CONFIG_DIR
+    else
+        export CLAUDE_CONFIG_DIR=$dir
+    fi
+    exec claude "${own[@]}" "$@"
+}
+
+#   ● work       you@company.com   ~/.claude            2 running
+#     personal   you@example.com   ~/.claude-personal
+list() {
+    load
+    local i account state_file widths=(0 0 0) mark bold= dim= green= off=
+    local -a accounts=() paths=() runs=()
+    get last || REPLY=
+    local last=$REPLY marked=0
+    for i in "${!names[@]}"; do
+        # The default's state file is beside ~/.claude, not in it.
+        state_file=${dirs[i]}/.claude.json
+        ((i == 0)) && state_file=$HOME/.claude.json
+        account=$(jq -r '.oauthAccount.emailAddress // empty' "$state_file" 2>/dev/null)
+        accounts[i]=${account:-not logged in}
+        tilde "${dirs[i]}"
+        paths[i]=$REPLY
+        running "${dirs[i]}" && runs[i]="$REPLY running" || runs[i]=
+        [[ ${names[i]} == "$last" ]] && marked=$i
+        ((${#names[i]} > widths[0])) && widths[0]=${#names[i]}
+        ((${#accounts[i]} > widths[1])) && widths[1]=${#accounts[i]}
+        ((${#paths[i]} > widths[2])) && widths[2]=${#paths[i]}
+    done
+
+    if [[ -t 1 ]]; then
+        bold=$'\e[1m' dim=$'\e[90m' green=$'\e[32m' off=$'\e[0m'
+    fi
+    for i in "${!names[@]}"; do
+        mark=' '
+        ((i == marked)) && mark=$green●$off
+        printf '%s %s%-*s%s   %-*s   %s%-*s%s   %s\n' "$mark" \
+            "$bold" "${widths[0]}" "${names[i]}" "$off" \
+            "${widths[1]}" "${accounts[i]}" \
+            "$dim" "${widths[2]}" "${paths[i]}" "$off" "${runs[i]}"
+    done
+    printf '\n%s%s%s\n' "$dim" "Run 'claude-profiles help' to see all commands." "$off"
+}
+
+add() {
+    load
+    valid_new "$1" || return
+    local name=$1 dir=$HOME/.claude-$1 seed='{}'
+    mkdir -p "$dir" && chmod 700 "$dir" || return
+
+    # Carry over the answers already given - onboarding and trusted folders -
+    # so the new profile doesn't start at Claude Code's first run. Nothing about
+    # the account comes along. The file is also what makes this a profile.
+    [[ -f $HOME/.claude.json ]] && seed=$HOME/.claude.json
+    jq '{hasCompletedOnboarding, lastOnboardingVersion, lastReleaseNotesSeen, theme,
+         autoUpdates, installMethod, mcpServers,
+         projects: ((.projects // {}) | map_values({hasTrustDialogAccepted}
+                                                  | with_entries(select(.value != null))))}
+        | with_entries(select(.value != null))' "$seed" >"$dir/.claude.json" 2>/dev/null ||
+        echo '{}' >"$dir/.claude.json"
+    chmod 600 "$dir/.claude.json"
+
+    share "$dir"
+    tilde "$dir"
+    echo "Added $name, in $REPLY, with everything the other profiles share."
+    echo "Log it in to its account:  claude $name, then /login"
+}
+
+remove() {
+    load
+    local name=$1 dir stamp kept
+    if [[ -z $name ]]; then
+        echo "Usage: claude-profiles remove <name>" >&2
+        return 2
+    elif [[ $name == "$default" ]]; then
+        say "$name is the default profile, ~/.claude, which holds the shared copy of everything."
+        say "It can be renamed, not removed."
+        return 1
+    elif ! dir_of "$name"; then
+        say "there's no profile called '$name'."
+        return 1
+    fi
+    dir=$REPLY
+    if running "$dir"; then
+        say "$name has $REPLY session(s) running. Close them first."
+        return 1
+    fi
+
+    read -r -p "Remove $name? Its login goes; history, settings and plugins stay shared. [y/N] " reply
+    [[ $reply == [yY]* ]] || return 1
+
+    # Anything it still holds of its own joins the shared copy first. The rest
+    # is kept out of the way rather than deleted - except the login, and the
+    # links, since a backup shouldn't lead into live data.
+    share "$dir" || return
+    printf -v stamp '%(%Y%m%d-%H%M%S)T' -1
+    kept=$hub/backups/removed-$name-$stamp
+    rm -f "$dir/.credentials.json"
+    find "$dir" -mindepth 1 -maxdepth 1 -type l -lname "$hub/*" -delete
+    mkdir -p "$hub/backups" && mv -T "$dir" "$kept" || return
+    get last && [[ $REPLY == "$name" ]] && put last "$default"
+    tilde "$kept"
+    echo "Removed $name. What was left of it is in $REPLY."
+}
+
+rename() {
+    load
+    local old=$1 new=$2 dir
+    if [[ -z $old || -z $new ]]; then
+        echo "Usage: claude-profiles rename <old> <new>" >&2
+        return 2
+    elif ! dir_of "$old"; then
+        say "there's no profile called '$old'."
+        return 1
+    fi
+    dir=$REPLY
+    valid_new "$new" || return
+
+    if [[ $old == "$default" ]]; then
+        put default-name "$new" # ~/.claude whatever it's called
+    else
+        if running "$dir"; then
+            say "$old has $REPLY session(s) running. Close them first."
+            return 1
+        fi
+        # Points plugin paths recorded through the old name at the shared copy,
+        # which nothing could do after the move.
+        share "$dir"
+        mv -T "$dir" "$HOME/.claude-$new" || return
+    fi
+    get last && [[ $REPLY == "$old" ]] && put last "$new"
+    echo "Renamed $old to $new."
+}
+
+# Can a new profile have this name? Says why not, if it can't.
+valid_new() {
+    local name=$1 line re='^  ([a-z][a-z|-]*)( |$)'
+    if [[ -z $name ]]; then
+        echo "Usage: claude-profiles add <name>" >&2
+        return 2
+    elif [[ ! $name =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+        say "a profile name is lowercase letters, digits, - and _."
+        return 1
+    elif dir_of "$name" || [[ -e $HOME/.claude-$name ]]; then
+        say "'$name' is taken."
+        return 1
+    fi
+    # `claude <name>` must open the profile, so the name can't be one of Claude
+    # Code's commands - asked of Claude Code, so later versions are covered too.
+    while IFS= read -r line; do
+        [[ $line =~ $re && "|${BASH_REMATCH[1]}|" == *"|$name|"* ]] || continue
+        say "'$name' is one of Claude Code's own commands (claude $name)."
+        return 1
+    done < <(claude --help 2>/dev/null)
+}
+
+usage() {
+    echo "Usage:
+  claude [<args>…]                     Claude Code, in the profile used last
+  claude <profile> [<args>…]           in that profile, which is then the one used last
+  claude-profiles                      list profiles, their accounts, and what's running
+  claude-profiles add <name>           add a profile, for another account
+  claude-profiles remove <name>        remove one; only its login goes
+  claude-profiles rename <old> <new>   rename one, the default included"
+}
+
+command=${1:-list}
+shift
+case $command in
+    list | ls) list ;;
+    add | new) add "$@" ;;
+    remove | rm) remove "$@" ;;
+    rename | mv) rename "$@" ;;
+    launch) launch "$@" ;;
+    help | -h | --help) usage ;;
+    _names) # for the shells' completions
+        load
+        for i in "${!names[@]}"; do
+            tilde "${dirs[i]}"
+            printf '%s\t%s\n' "${names[i]}" "$REPLY"
+        done
+        ;;
+    *)
+        say "no such command '$command'. See 'claude-profiles help'."
+        exit 2
+        ;;
+esac

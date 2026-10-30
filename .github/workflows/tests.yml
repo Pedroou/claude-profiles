@@ -1,0 +1,25 @@
+name: tests
+
+# The suites are hermetic: each builds a throwaway $HOME, a stand-in `claude`
+# and a fake /proc, so nothing here needs Claude Code or an account. zsh and fish
+# are installed so their `claude` is checked too.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq, rsync, zsh and fish
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq rsync zsh fish
+
+      - name: Tests
+        run: test/run.sh
