@@ -107,5 +107,7 @@ directory) and fails if any of that changed.
 
 ## Releases
 
-A release is an annotated tag whose message is the release notes. Pushing it
-runs the tests, then publishes the GitHub release.
+A release's notes are its section of `CHANGELOG.md`. Pushing a `v*` tag runs
+the tests, then publishes the GitHub release with that section, and fails if
+there isn't one. Changing `CHANGELOG.md` on `main` updates the notes of every
+release it covers, so the two can't drift.

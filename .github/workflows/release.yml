@@ -1,33 +1,57 @@
 name: release
 
-# A release is an annotated tag: its message is the release notes.
-#   git tag -a v1.1.0 -m "…" && git push origin v1.1.0
-# The tests run first, so a tag on a broken commit publishes nothing.
+# Release notes are CHANGELOG.md's section for the version. To release, add that
+# section, then push a tag:  git tag -a v1.1.0 -m v1.1.0 && git push origin v1.1.0
+# The tests run first, so a tag on a broken commit publishes nothing. A change to
+# CHANGELOG.md on main rewrites the notes of every release it covers.
 on:
   push:
     tags: ['v*']
+    branches: [main]
+    paths: [CHANGELOG.md]
 
 jobs:
   tests:
+    if: github.ref_type == 'tag'
     uses: ./.github/workflows/tests.yml
 
-  release:
+  publish:
+    if: github.ref_type == 'tag'
     needs: tests
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # actions/checkout leaves a tag lightweight; this brings back its message.
-      - run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
 
       # A tag moved after its release was published keeps that release.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          .github/release-notes.sh "$GITHUB_REF_NAME" >notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for $GITHUB_REF_NAME"
+            exit 1
+          fi
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
-            gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag --title "$GITHUB_REF_NAME"
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
+
+  notes:
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Match every release's notes to CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for tag in $(gh release list --json tagName --jq '.[].tagName'); do
+            .github/release-notes.sh "$tag" >notes.md
+            if grep -q '[^[:space:]]' notes.md; then
+              gh release edit "$tag" --notes-file notes.md
+            fi
+          done
